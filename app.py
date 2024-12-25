@@ -9,6 +9,8 @@ import os
 from dotenv import load_dotenv
 import pytz
 import logging
+from google.oauth2 import service_account
+
 logging.getLogger('root').setLevel(logging.ERROR)
 
 load_dotenv()
@@ -16,25 +18,11 @@ load_dotenv()
 SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 
 def authenticate():
-    creds = None
-    # Token is saved after first authentication
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
-            creds = pickle.load(token)
-    # Authenticate if no valid credentials
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(google.auth.transport.requests.Request())
-        else:
-            from google_auth_oauthlib.flow import InstalledAppFlow
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        # Save the token for later runs
-        with open('token.pickle', 'wb') as token:
-            pickle.dump(creds, token)
+    creds = service_account.Credentials.from_service_account_file(
+        'service_account.json',
+        scopes=['https://www.googleapis.com/auth/calendar.readonly']
+    )
     return creds
-
 
 
 app = Flask(__name__)
