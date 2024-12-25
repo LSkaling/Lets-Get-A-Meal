@@ -3,3 +3,8 @@ venv/
 credentials.json
 token.pickle
 service_account.json
+cert.pem
+idp_cert.pem
+key.pem
+stanford_metadata.xml
+__pycache__/
