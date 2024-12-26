@@ -8,3 +8,8 @@ idp_cert.pem
 key.pem
 stanford_metadata.xml
 __pycache__/
+/old_credentials
+metadata_chrome_8.xml
+saml_key.pem
+saml_test/isrg-root-x1.pem
+saml_test/lets-encrypt-r3.pem

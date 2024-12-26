@@ -1,4 +1,4 @@
-from flask import Flask, render_template, url_for, Response, session, redirect
+from flask import Flask, render_template, url_for, Response, session, redirect, request, send_file
 from datetime import datetime, timedelta
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
@@ -14,10 +14,12 @@ from saml import saml_bp
 from flask_saml2.sp import ServiceProvider
 from flask_saml2.idp.idp import IdentityProvider
 from flask_saml2.utils import certificate_from_file
+
+from onelogin.saml2.auth import OneLogin_Saml2_Auth
+from werkzeug.middleware.proxy_fix import ProxyFix
+import json
+from lxml import etree
 import base64
-import zlib
-from xml.etree import ElementTree as ET
-from urllib.parse import quote
 
 
 logging.getLogger('root').setLevel(logging.ERROR)
@@ -26,117 +28,9 @@ load_dotenv()
 
 SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 
-def create_authn_request(entity_id, acs_url):
-    """
-    Manually create a SAML AuthnRequest.
-    """
-    request = ET.Element('samlp:AuthnRequest', {
-        'xmlns:samlp': 'urn:oasis:names:tc:SAML:2.0:protocol',
-        'xmlns:saml': 'urn:oasis:names:tc:SAML:2.0:assertion',
-        'ID': '_{}'.format(base64.urlsafe_b64encode(zlib.compress(entity_id.encode())).decode('utf-8')),
-        'Version': '2.0',
-        'IssueInstant': '2024-12-25T10:55:10Z',
-        'Destination': 'https://login.stanford.edu/idp/profile/SAML2/Redirect/SSO',
-        'AssertionConsumerServiceURL': acs_url
-    })
-
-    issuer = ET.SubElement(request, 'saml:Issuer')
-    issuer.text = entity_id
-
-    # Encode the XML request
-    xml_str = ET.tostring(request, encoding='utf-8', method='xml')
-    saml_request = base64.b64encode(zlib.compress(xml_str)).decode('utf-8')
-
-    return quote(saml_request)
-
-class StanfordSSO(ServiceProvider):
-    def get_blueprint_name(self):
-        return 'flask_saml2_sp'  # This should match the blueprint name in saml.py
-
-    # Override to provide correct entity ID
-    def get_sp_entity_id(self):
-        return "https://meals.lawtonskaling.com/saml/"
-
-    def get_sp_config(self):
-        return {
-            'certificate': self.certificate,
-            'private_key': self.private_key,
-            'entity_id': self.get_sp_entity_id(),
-            'acs_url': url_for(self.blueprint_name + '.acs', _external=True),
-            'sls_url': url_for(self.blueprint_name + '.sls', _external=True),
-        }
-
-    def __init__(self, certificate, private_key):
-        super().__init__()
-        self.certificate = certificate
-        self.private_key = private_key
-
-    def get_acs_url(self):
-        return url_for('saml.acs', _external=True)    
-
-    # Manually implement metadata generation
-    def get_metadata(self):
-        entity_id = self.get_sp_entity_id()
-        acs_url = self.get_acs_url()
-        cert = self.certificate.replace("\n", "")
-
-        # Create SAML metadata manually
-        metadata = f"""
-        <EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="{entity_id}">
-            <SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
-                <KeyDescriptor use="signing">
-                    <KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
-                        <X509Data>
-                            <X509Certificate>{cert}</X509Certificate>
-                        </X509Data>
-                    </KeyInfo>
-                </KeyDescriptor>
-                <AssertionConsumerService
-                    Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
-                    Location="{acs_url}"
-                    index="1"/>
-            </SPSSODescriptor>
-        </EntityDescriptor>
-        """
-        return metadata.strip()
-
-class StanfordIdentityProvider(IdentityProvider):
-    def __init__(self, *args, **kwargs):
-        super().__init__()  # Call parent with no arguments
-        
-        # Store configuration and set entity_id
-        self.config = kwargs.get('config', {})
-        self.entity_id = self.config.get('entity_id', 'https://idp.stanford.edu/')
-        self.sso_url = self.config.get('sso_url', 'https://login.stanford.edu/idp/profile/SAML2/Redirect/SSO')
-    
-    def is_user_logged_in(self) -> bool:
-        return 'user' in session
-
-    def login_required(self):
-        if not self.is_user_logged_in():
-            return redirect(url_for('login'))
-
-    def get_current_user(self):
-        return session.get('user')
-
-    def logout(self):
-        session.clear()
-
-    def make_login_request_url(self, next_url=None):
-        """Generate the SSO URL with a SAMLRequest."""
-        saml_request = create_authn_request(
-            entity_id=self.entity_id,
-            acs_url=url_for('flask_saml2_sp.acs', _external=True),
-        )
-        params = {
-            'SAMLRequest': saml_request
-        }
-        if next_url:
-            params['RelayState'] = next_url
-        
-        query = '&'.join([f"{k}={v}" for k, v in params.items()])
-        return f"{self.sso_url}?{query}"
-
+app = Flask(__name__)
+#app.secret_key = os.urandom(24)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 
 def authenticate():
@@ -145,61 +39,140 @@ def authenticate():
         scopes=['https://www.googleapis.com/auth/calendar.readonly']
     )
     return creds
-def key_from_file(filepath):
-    with open(filepath, 'r') as f:
-        return f.read()
 
-def login_required(f):
-    def decorated_function(*args, **kwargs):
-        if 'user' not in session:
-            return redirect(url_for('flask_saml2_sp.login'))
-        return f(*args, **kwargs)
-    return decorated_function
-
-
-
-app = Flask(__name__)
-
-# Initialize StanfordSSO with certificate and key during instantiation
-sp = StanfordSSO(
-    certificate=certificate_from_file('cert.pem'),
-    private_key=key_from_file('key.pem')
-)
-
-# Register the SAML blueprint
-app.register_blueprint(sp.create_blueprint(), url_prefix='/saml')
-
-# Store SAML SP in app config for reference if needed
-app.config['SAML2_SP'] = sp
-
-app.config['SAML2_IDENTITY_PROVIDERS'] = [
-    {
-        'CLASS': 'app.StanfordIdentityProvider',
-        'OPTIONS': {
-            'entity_id': 'https://idp.stanford.edu/',  # Stanford's IdP entity ID
-            'sso_url': 'https://login.stanford.edu/idp/profile/SAML2/Redirect/SSO',
-            'slo_url': 'https://login.stanford.edu/idp/profile/SAML2/Redirect/SLO',  # SLO if needed
-            'certificate': certificate_from_file('idp_cert.pem')  # IdP public cert
-        }
+def prepare_request(request):
+    url_data = request.url.split(request.path)
+    return {
+        'https': 'on' if request.scheme == 'https' else 'off',
+        'http_host': url_data[0].replace('http://', '').replace('https://', ''),
+        'server_port': request.environ['SERVER_PORT'],
+        'script_name': request.path,
+        'get_data': request.args.copy(),
+        'post_data': request.form.copy()
     }
-]
 
 
-# Service Provider Configuration
-app.config['SAML2_SERVICE_PROVIDERS'] = [
-    {
-        'CLASS': 'flask_saml2.idp.idp.IdentityProvider',
-        'OPTIONS': {
-            'acs_url': 'https://meals.lawtonskaling.com/saml/acs/',
-            'entity_id': 'https://meals.lawtonskaling.com/saml/',
-        }
+
+@app.route('/login')
+def login():
+    req = prepare_request(request)
+    auth = OneLogin_Saml2_Auth(req, custom_base_path=os.path.join(os.path.dirname(__file__), 'saml'))
+    return redirect(auth.login())
+
+# @app.route('/sso/acs', methods=['POST'])
+# def acs():
+#     print(request.headers)  # Log all headers
+#     req = prepare_request(request)
+#     auth = OneLogin_Saml2_Auth(req, custom_base_path=os.path.join(os.path.dirname(__file__), 'saml'))
+#     auth.process_response()
+
+#     errors = auth.get_errors()
+#     print("SAML Response: ", auth.get_last_response_xml())  # Debugging
+#     if errors:
+#         print("Errors: ", errors)
+#         return f"Error: {', '.join(errors)}"
+
+#     session['user_data'] = auth.get_attributes()
+#     return redirect('/')
+
+def prepare_saml_auth():
+    req = {
+        'http_host': request.host,
+        'script_name': request.path,
+        'get_data': request.args.copy(),
+        'post_data': request.form.copy()
     }
-]
+    saml_path = os.path.join(os.path.dirname(__file__), 'saml')
+    return OneLogin_Saml2_Auth(req, custom_base_path=saml_path)
+
+@app.route('/sso/acs', methods=['POST'])
+def acs():
+    saml_response = request.form.get('SAMLResponse')
+    with open('/tmp/saml_response.xml', 'wb') as f:
+        f.write(base64.b64decode(saml_response))
+    auth = prepare_saml_auth()
+    auth.process_response()
+    return redirect('/')
+
+
+
+@app.route('/logout')
+def logout():
+    req = prepare_request(request)
+    auth = OneLogin_Saml2_Auth(req, custom_base_path=os.path.join(os.path.dirname(__file__), 'saml'))
+    return redirect(auth.logout())
+
+@app.route('/saml/metadata')
+def metadata():
+    # Load settings.json
+    settings_path = os.path.join(os.path.dirname(__file__), 'saml', 'settings.json')
+    with open(settings_path, 'r') as f:
+        settings = json.load(f)
+
+    # Generate SAML Metadata XML
+    metadata_xml = generate_saml_metadata(settings)
+
+    # Return XML Response
+    return Response(metadata_xml, content_type='application/xml')
+
+def generate_saml_metadata(settings):
+    # Create XML Root
+    entity_descriptor = etree.Element(
+        "EntityDescriptor",
+        xmlns="urn:oasis:names:tc:SAML:2.0:metadata",
+        entityID=settings["sp"]["entityId"]
+    )
+
+    # SPSSODescriptor (Service Provider SSO Descriptor)
+    spsso_descriptor = etree.SubElement(
+        entity_descriptor, "SPSSODescriptor",
+        protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"
+    )
+
+    # Signing KeyDescriptor
+    add_key_descriptor(spsso_descriptor, settings["sp"]["certificate"], "signing")
+
+    # Encryption KeyDescriptor (Optional, if present in settings)
+    if "encryptionCertificate" in settings["sp"]:
+        add_key_descriptor(spsso_descriptor, settings["sp"]["encryptionCertificate"], "encryption")
+
+    # AssertionConsumerService
+    etree.SubElement(
+        spsso_descriptor, "AssertionConsumerService",
+        Binding=settings["sp"]["assertionConsumerService"]["binding"],
+        Location=settings["sp"]["assertionConsumerService"]["url"],
+        index="1"
+    )
+
+    # SingleLogoutService (Optional)
+    if "singleLogoutService" in settings:
+        etree.SubElement(
+            spsso_descriptor, "SingleLogoutService",
+            Binding=settings["sp"]["singleLogoutService"]["binding"],
+            Location=settings["sp"]["singleLogoutService"]["url"]
+        )
+
+    # Serialize XML
+    return etree.tostring(entity_descriptor, pretty_print=True, xml_declaration=True, encoding="UTF-8")
+
+
+def add_key_descriptor(parent, cert_path, use):
+    # Read certificate from file
+    with open(cert_path, 'r') as f:
+        cert = f.read().replace('-----BEGIN CERTIFICATE-----', '').replace('-----END CERTIFICATE-----', '').replace('\n', '')
+
+    # KeyDescriptor Element
+    key_descriptor = etree.SubElement(parent, "KeyDescriptor", use=use)
+    key_info = etree.SubElement(key_descriptor, "KeyInfo", xmlns="http://www.w3.org/2000/09/xmldsig#")
+    x509_data = etree.SubElement(key_info, "X509Data")
+    x509_certificate = etree.SubElement(x509_data, "X509Certificate")
+
+    # Insert certificate data
+    x509_certificate.text = cert    
 
 
 
 @app.route('/')
-@login_required
 def home():
     tz = pytz.timezone('America/Los_Angeles')
 
