@@ -15,11 +15,10 @@ from flask_saml2.sp import ServiceProvider
 from flask_saml2.idp.idp import IdentityProvider
 from flask_saml2.utils import certificate_from_file
 
-from onelogin.saml2.auth import OneLogin_Saml2_Auth
-from werkzeug.middleware.proxy_fix import ProxyFix
-import json
-from lxml import etree
-import base64
+from authlib.integrations.flask_client import OAuth
+from flask_session import Session
+import redis
+
 
 
 logging.getLogger('root').setLevel(logging.ERROR)
@@ -29,8 +28,35 @@ load_dotenv()
 SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 
 app = Flask(__name__)
-#app.secret_key = os.urandom(24)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.secret_key = os.urandom(24)
+app.config['SESSION_TYPE'] = 'redis'
+app.config['SESSION_PERMANENT'] = False
+app.config['SESSION_USE_SIGNER'] = True
+app.config['SESSION_KEY_PREFIX'] = 'meals:'
+app.config['SESSION_REDIS'] = redis.from_url('redis://localhost:6379')
+
+
+Session(app)
+
+# OIDC Configuration (replace with your IdP details)
+app.config['OIDC_CLIENT_ID'] = os.getenv("CLIENT_ID")
+app.config['OIDC_CLIENT_SECRET'] = os.getenv("CLIENT_SECRET")
+app.config['OIDC_DISCOVERY_URL'] = 'https://idp.stanford.edu/.well-known/openid-configuration'
+
+oauth = OAuth(app)
+
+oidc = oauth.register(
+    name='oidc',
+    client_id=app.config['OIDC_CLIENT_ID'],
+    client_secret=app.config['OIDC_CLIENT_SECRET'],
+    server_metadata_url=app.config['OIDC_DISCOVERY_URL'],
+    client_kwargs={
+        'scope': 'openid',
+    }
+)
+
+
+
 
 
 def authenticate():
@@ -55,121 +81,31 @@ def prepare_request(request):
 
 @app.route('/login')
 def login():
-    req = prepare_request(request)
-    auth = OneLogin_Saml2_Auth(req, custom_base_path=os.path.join(os.path.dirname(__file__), 'saml'))
-    return redirect(auth.login())
+    redirect_uri = url_for('auth', _external=True)
+    return oidc.authorize_redirect(redirect_uri)
 
-# @app.route('/sso/acs', methods=['POST'])
-# def acs():
-#     print(request.headers)  # Log all headers
-#     req = prepare_request(request)
-#     auth = OneLogin_Saml2_Auth(req, custom_base_path=os.path.join(os.path.dirname(__file__), 'saml'))
-#     auth.process_response()
-
-#     errors = auth.get_errors()
-#     print("SAML Response: ", auth.get_last_response_xml())  # Debugging
-#     if errors:
-#         print("Errors: ", errors)
-#         return f"Error: {', '.join(errors)}"
-
-#     session['user_data'] = auth.get_attributes()
-#     return redirect('/')
-
-def prepare_saml_auth():
-    req = {
-        'http_host': request.host,
-        'script_name': request.path,
-        'get_data': request.args.copy(),
-        'post_data': request.form.copy()
-    }
-    saml_path = os.path.join(os.path.dirname(__file__), 'saml')
-    return OneLogin_Saml2_Auth(req, custom_base_path=saml_path)
-
-@app.route('/sso/acs', methods=['POST'])
-def acs():
-    saml_response = request.form.get('SAMLResponse')
-    with open('/tmp/saml_response.xml', 'wb') as f:
-        f.write(base64.b64decode(saml_response))
-    auth = prepare_saml_auth()
-    auth.process_response()
-    return redirect('/')
+@app.route('/auth')
+def auth():
+    app.logger.info(f"Session at /auth: {session}")
+    if 'state' not in session:
+        return redirect('/login')    
+    # Exchange authorization code for token
+    token = oidc.authorize_access_token()
+    user_info = oidc.parse_id_token(token)  # Decode user info from ID token
+    session['user'] = user_info
+    return redirect('/')  # Redirect to dashboard or protected page
 
 
+@app.route('/dashboard')
+def dashboard():
+    if 'user' in session:
+        return f"Hello, {session['user']['name']}!"
+    return redirect('/login')
 
 @app.route('/logout')
 def logout():
-    req = prepare_request(request)
-    auth = OneLogin_Saml2_Auth(req, custom_base_path=os.path.join(os.path.dirname(__file__), 'saml'))
-    return redirect(auth.logout())
-
-@app.route('/saml/metadata')
-def metadata():
-    # Load settings.json
-    settings_path = os.path.join(os.path.dirname(__file__), 'saml', 'settings.json')
-    with open(settings_path, 'r') as f:
-        settings = json.load(f)
-
-    # Generate SAML Metadata XML
-    metadata_xml = generate_saml_metadata(settings)
-
-    # Return XML Response
-    return Response(metadata_xml, content_type='application/xml')
-
-def generate_saml_metadata(settings):
-    # Create XML Root
-    entity_descriptor = etree.Element(
-        "EntityDescriptor",
-        xmlns="urn:oasis:names:tc:SAML:2.0:metadata",
-        entityID=settings["sp"]["entityId"]
-    )
-
-    # SPSSODescriptor (Service Provider SSO Descriptor)
-    spsso_descriptor = etree.SubElement(
-        entity_descriptor, "SPSSODescriptor",
-        protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"
-    )
-
-    # Signing KeyDescriptor
-    add_key_descriptor(spsso_descriptor, settings["sp"]["certificate"], "signing")
-
-    # Encryption KeyDescriptor (Optional, if present in settings)
-    if "encryptionCertificate" in settings["sp"]:
-        add_key_descriptor(spsso_descriptor, settings["sp"]["encryptionCertificate"], "encryption")
-
-    # AssertionConsumerService
-    etree.SubElement(
-        spsso_descriptor, "AssertionConsumerService",
-        Binding=settings["sp"]["assertionConsumerService"]["binding"],
-        Location=settings["sp"]["assertionConsumerService"]["url"],
-        index="1"
-    )
-
-    # SingleLogoutService (Optional)
-    if "singleLogoutService" in settings:
-        etree.SubElement(
-            spsso_descriptor, "SingleLogoutService",
-            Binding=settings["sp"]["singleLogoutService"]["binding"],
-            Location=settings["sp"]["singleLogoutService"]["url"]
-        )
-
-    # Serialize XML
-    return etree.tostring(entity_descriptor, pretty_print=True, xml_declaration=True, encoding="UTF-8")
-
-
-def add_key_descriptor(parent, cert_path, use):
-    # Read certificate from file
-    with open(cert_path, 'r') as f:
-        cert = f.read().replace('-----BEGIN CERTIFICATE-----', '').replace('-----END CERTIFICATE-----', '').replace('\n', '')
-
-    # KeyDescriptor Element
-    key_descriptor = etree.SubElement(parent, "KeyDescriptor", use=use)
-    key_info = etree.SubElement(key_descriptor, "KeyInfo", xmlns="http://www.w3.org/2000/09/xmldsig#")
-    x509_data = etree.SubElement(key_info, "X509Data")
-    x509_certificate = etree.SubElement(x509_data, "X509Certificate")
-
-    # Insert certificate data
-    x509_certificate.text = cert    
-
+    session.clear()
+    return redirect('/')
 
 
 @app.route('/')
