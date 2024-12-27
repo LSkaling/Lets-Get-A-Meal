@@ -1,4 +1,4 @@
-from flask import Flask, render_template, url_for,  session, redirect, request, send_file
+from flask import Flask, render_template, url_for,  session, redirect, request, send_file, jsonify
 from datetime import datetime, timedelta
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
@@ -13,6 +13,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from lxml import etree
 from functools import wraps
 from flask_session import Session
+import json
 
 
 # Configure logging to systemd journal
@@ -26,7 +27,7 @@ SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
-app.secret_key = os.getenv("APP_SECRET_KEY")  # Essential for sessions
+app.secret_key = os.getenv("APP_SECRET_KEY")
 app.config['SESSION_TYPE'] = 'filesystem'  # Use server-side session
 app.config['SESSION_PERMANENT'] = False
 app.config['SESSION_USE_SIGNER'] = True
@@ -74,8 +75,6 @@ def init_saml_auth(req):
     auth = OneLogin_Saml2_Auth(prepare_flask_request(req), custom_base_path='/var/www/Lets-Get-A-Meal/saml/')
     return auth
 
-
-
 @app.route('/login')
 def login():
     if 'logged_in' in session:
@@ -83,22 +82,6 @@ def login():
     # Trigger SAML login process
     auth = init_saml_auth(request)
     return redirect(auth.login())
-
-# @app.route('/sso/acs', methods=['POST'])
-# def acs():
-#     print(request.headers)  # Log all headers
-#     req = prepare_request(request)
-#     auth = OneLogin_Saml2_Auth(req, custom_base_path=os.path.join(os.path.dirname(__file__), 'saml'))
-#     auth.process_response()
-
-#     errors = auth.get_errors()
-#     print("SAML Response: ", auth.get_last_response_xml())  # Debugging
-#     if errors:
-#         print("Errors: ", errors)
-#         return f"Error: {', '.join(errors)}"
-
-#     session['user_data'] = auth.get_attributes()
-#     return redirect('/')
 
 def prepare_saml_auth():
     req = {
@@ -133,67 +116,13 @@ def debug_session():
 
 @app.route('/logout')
 def logout():
-    req = prepare_request(request)
+    req = prepare_flask_request(request)
     auth = OneLogin_Saml2_Auth(req, custom_base_path=os.path.join(os.path.dirname(__file__), 'saml'))
     return redirect(auth.logout())
 
 @app.route('/saml/metadata')
 def saml_metadata():
     return send_file('/var/www/Lets-Get-A-Meal/saml/metadata.xml', mimetype='text/xml')
-
-# @app.route('/saml/metadata')
-# def metadata():
-#     # Load settings.json
-#     settings_path = os.path.join(os.path.dirname(__file__), 'saml', 'settings.json')
-#     with open(settings_path, 'r') as f:
-#         settings = json.load(f)
-
-#     # Generate SAML Metadata XML
-#     metadata_xml = generate_saml_metadata(settings)
-
-#     # Return XML Response
-#     return Response(metadata_xml, content_type='application/xml')
-
-def generate_saml_metadata(settings):
-    # Create XML Root
-    entity_descriptor = etree.Element(
-        "EntityDescriptor",
-        xmlns="urn:oasis:names:tc:SAML:2.0:metadata",
-        entityID=settings["sp"]["entityId"]
-    )
-
-    # SPSSODescriptor (Service Provider SSO Descriptor)
-    spsso_descriptor = etree.SubElement(
-        entity_descriptor, "SPSSODescriptor",
-        protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"
-    )
-
-    # Signing KeyDescriptor
-    add_key_descriptor(spsso_descriptor, settings["sp"]["certificate"], "signing")
-
-    # Encryption KeyDescriptor (Optional, if present in settings)
-    if "encryptionCertificate" in settings["sp"]:
-        add_key_descriptor(spsso_descriptor, settings["sp"]["encryptionCertificate"], "encryption")
-
-    # AssertionConsumerService
-    etree.SubElement(
-        spsso_descriptor, "AssertionConsumerService",
-        Binding=settings["sp"]["assertionConsumerService"]["binding"],
-        Location=settings["sp"]["assertionConsumerService"]["url"],
-        index="1"
-    )
-
-    # SingleLogoutService (Optional)
-    if "singleLogoutService" in settings:
-        etree.SubElement(
-            spsso_descriptor, "SingleLogoutService",
-            Binding=settings["sp"]["singleLogoutService"]["binding"],
-            Location=settings["sp"]["singleLogoutService"]["url"]
-        )
-
-    # Serialize XML
-    return etree.tostring(entity_descriptor, pretty_print=True, xml_declaration=True, encoding="UTF-8")
-
 
 def add_key_descriptor(parent, cert_path, use):
     # Read certificate from file
@@ -207,10 +136,19 @@ def add_key_descriptor(parent, cert_path, use):
     x509_certificate = etree.SubElement(x509_data, "X509Certificate")
 
     # Insert certificate data
-    x509_certificate.text = cert    
+    x509_certificate.text = cert
 
+from flask import Flask, jsonify, request, redirect, url_for, session
+from onelogin.saml2.auth import OneLogin_Saml2_Auth
+import json
 
+app = Flask(__name__)
 
+@app.route('/health')
+def health_check():
+    return jsonify({"status": "ok"}), 200
+
+    
 @app.route('/')
 @login_required
 def home():
