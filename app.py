@@ -1,26 +1,16 @@
-from flask import Flask, render_template, url_for, Response, session, redirect, request, send_file
+from flask import Flask, render_template, url_for,  session, redirect, request, send_file
 from datetime import datetime, timedelta
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 import os.path
-import google.auth.transport.requests
-import pickle
 import os
 from dotenv import load_dotenv
 import pytz
 import logging
 from google.oauth2 import service_account
-from saml import saml_bp
-from flask_saml2.sp import ServiceProvider
-from flask_saml2.idp.idp import IdentityProvider
-from flask_saml2.utils import certificate_from_file
-
 from onelogin.saml2.auth import OneLogin_Saml2_Auth
 from werkzeug.middleware.proxy_fix import ProxyFix
-import json
 from lxml import etree
-import base64
-from onelogin.saml2.settings import OneLogin_Saml2_Settings
 from functools import wraps
 from flask_session import Session
 
