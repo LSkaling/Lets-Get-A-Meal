@@ -36,7 +36,7 @@ SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
-app.secret_key = 'e730f55a2ac1827a669b6d41d21ac75f4fb700fa115d716ea2985e4f7875fdda'  # Essential for sessions
+app.secret_key = os.getenv("APP_SECRET_KEY")  # Essential for sessions
 app.config['SESSION_TYPE'] = 'filesystem'  # Use server-side session
 app.config['SESSION_PERMANENT'] = False
 app.config['SESSION_USE_SIGNER'] = True
