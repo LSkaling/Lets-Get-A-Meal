@@ -20,17 +20,44 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import json
 from lxml import etree
 import base64
+from onelogin.saml2.settings import OneLogin_Saml2_Settings
+from functools import wraps
+from flask_session import Session
 
 
-logging.getLogger('root').setLevel(logging.ERROR)
+# Configure logging to systemd journal
+logging.basicConfig(level=logging.INFO)  # Log info and higher severity
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
 SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 
 app = Flask(__name__)
-#app.secret_key = os.urandom(24)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
+app.secret_key = 'e730f55a2ac1827a669b6d41d21ac75f4fb700fa115d716ea2985e4f7875fdda'  # Essential for sessions
+app.config['SESSION_TYPE'] = 'filesystem'  # Use server-side session
+app.config['SESSION_PERMANENT'] = False
+app.config['SESSION_USE_SIGNER'] = True
+app.config['SESSION_COOKIE_SECURE'] = True  # Secure cookies over HTTPS
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
+Session(app)
+
+@app.before_request
+def before_request():
+    if request.headers.get('X-Forwarded-Proto') == 'https':
+        request.environ['wsgi.url_scheme'] = 'https'
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'logged_in' not in session:
+            return redirect(url_for('login'))  # Redirect to login if not authenticated
+        return f(*args, **kwargs)
+    return decorated_function
 
 
 def authenticate():
@@ -40,23 +67,31 @@ def authenticate():
     )
     return creds
 
-def prepare_request(request):
-    url_data = request.url.split(request.path)
+def prepare_flask_request(req):
+    """Prepare the Flask request to be compatible with the SAML toolkit"""
+    url_data = request.url.split('?', 1)
     return {
-        'https': 'on' if request.scheme == 'https' else 'off',
-        'http_host': url_data[0].replace('http://', '').replace('https://', ''),
+        'https': 'on' if request.is_secure else 'off',
+        'http_host': request.host,
         'server_port': request.environ['SERVER_PORT'],
         'script_name': request.path,
         'get_data': request.args.copy(),
-        'post_data': request.form.copy()
+        'post_data': req.form.copy()
     }
+
+def init_saml_auth(req):
+    """Initialize SAML authentication object"""
+    auth = OneLogin_Saml2_Auth(prepare_flask_request(req), custom_base_path='/var/www/Lets-Get-A-Meal/saml/')
+    return auth
 
 
 
 @app.route('/login')
 def login():
-    req = prepare_request(request)
-    auth = OneLogin_Saml2_Auth(req, custom_base_path=os.path.join(os.path.dirname(__file__), 'saml'))
+    if 'logged_in' in session:
+        return redirect(url_for('home'))
+    # Trigger SAML login process
+    auth = init_saml_auth(request)
     return redirect(auth.login())
 
 # @app.route('/sso/acs', methods=['POST'])
@@ -86,15 +121,25 @@ def prepare_saml_auth():
     return OneLogin_Saml2_Auth(req, custom_base_path=saml_path)
 
 @app.route('/sso/acs', methods=['POST'])
-def acs():
-    saml_response = request.form.get('SAMLResponse')
-    with open('/tmp/saml_response.xml', 'wb') as f:
-        f.write(base64.b64decode(saml_response))
-    auth = prepare_saml_auth()
-    auth.process_response()
-    return redirect('/')
+def sso_acs():
+    auth = init_saml_auth(request)
+    errors = auth.get_errors()
+    if not errors:
+        attributes = auth.get_attributes()
+        session['saml_attributes'] = attributes if attributes else {'email': 'unknown@example.com'}
+        session['logged_in'] = True
+        session.modified = True  # Explicitly mark session for saving
+        
+        logger.info("User logged in. Session saved: %s", session)
+        
+        return redirect('/')
+    else:
+        logger.error("SAML Error: %s", ', '.join(errors))
+        return f"Error: {', '.join(errors)}", 500
 
-
+@app.route('/debug/session')
+def debug_session():
+    return f"Session Data: {session.get('saml_attributes', 'No user data')}<br>Logged In: {session.get('logged_in', False)}"
 
 @app.route('/logout')
 def logout():
@@ -103,17 +148,21 @@ def logout():
     return redirect(auth.logout())
 
 @app.route('/saml/metadata')
-def metadata():
-    # Load settings.json
-    settings_path = os.path.join(os.path.dirname(__file__), 'saml', 'settings.json')
-    with open(settings_path, 'r') as f:
-        settings = json.load(f)
+def saml_metadata():
+    return send_file('/var/www/Lets-Get-A-Meal/saml/metadata.xml', mimetype='text/xml')
 
-    # Generate SAML Metadata XML
-    metadata_xml = generate_saml_metadata(settings)
+# @app.route('/saml/metadata')
+# def metadata():
+#     # Load settings.json
+#     settings_path = os.path.join(os.path.dirname(__file__), 'saml', 'settings.json')
+#     with open(settings_path, 'r') as f:
+#         settings = json.load(f)
 
-    # Return XML Response
-    return Response(metadata_xml, content_type='application/xml')
+#     # Generate SAML Metadata XML
+#     metadata_xml = generate_saml_metadata(settings)
+
+#     # Return XML Response
+#     return Response(metadata_xml, content_type='application/xml')
 
 def generate_saml_metadata(settings):
     # Create XML Root
@@ -173,6 +222,7 @@ def add_key_descriptor(parent, cert_path, use):
 
 
 @app.route('/')
+@login_required
 def home():
     tz = pytz.timezone('America/Los_Angeles')
 

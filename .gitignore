@@ -13,3 +13,9 @@ metadata_chrome_8.xml
 saml_key.pem
 saml_test/isrg-root-x1.pem
 saml_test/lets-encrypt-r3.pem
+flask_session/
+sessions/
+saml-cert.pem
+saml-key.pem
+saml/metadata.xml
+saml/settings.json
