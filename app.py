@@ -138,17 +138,11 @@ def add_key_descriptor(parent, cert_path, use):
     # Insert certificate data
     x509_certificate.text = cert
 
-from flask import Flask, jsonify, request, redirect, url_for, session
-from onelogin.saml2.auth import OneLogin_Saml2_Auth
-import json
-
-app = Flask(__name__)
-
 @app.route('/health')
 def health_check():
     return jsonify({"status": "ok"}), 200
 
-    
+
 @app.route('/')
 @login_required
 def home():
